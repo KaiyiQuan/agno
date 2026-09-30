@@ -17,7 +17,6 @@ from typing import (
     Literal,
     NamedTuple,
     Optional,
-    Set,
     Union,
     get_type_hints,
 )
@@ -77,7 +76,7 @@ logger = logging.getLogger(__name__)
 # tag set lives in agno/os/config.py next to the MCPConfig fields that consume it --
 # single source of truth so adding a new tag is a one-place change.
 from agno.os.config import MCP_BUILTIN_TAGS as _BUILTIN_TOOL_TAGS  # noqa: E402
-from agno.os.config import MCP_SERVER_CARD_PATH  # noqa: E402
+from agno.os.config import MCP_SERVER_CARD_PATH, MCP_TOOL_RUN_PATH  # noqa: E402
 
 # Names of the default (built-in) tools by tag set, used to detect name collisions with
 # exposed components before registration. Keep in sync with the ``name=`` / ``tags=``
@@ -2072,6 +2071,14 @@ def _server_card_enabled(mcp_config: "Optional[MCPConfig]") -> bool:
     return mcp_config is None or mcp_config.server_card
 
 
+# Mirrors ``MCPConfig.tool_run_timeout_seconds`` for ``mcp=True``, which has no config object.
+_DEFAULT_TOOL_RUN_TIMEOUT_SECONDS = 120.0
+
+
+def _tool_run_api_enabled(mcp_config: "Optional[MCPConfig]") -> bool:
+    return mcp_config is None or mcp_config.tool_run_api
+
+
 def _card_name(hostname: str, server_name: str) -> str:
     """The card's reverse-DNS name: the request host reversed, a slash, the server name as a slug.
 
@@ -2105,6 +2112,26 @@ def _truncate(value: str, limit: int) -> str:
     return value if len(value) <= limit else value[: limit - 1].rstrip() + "…"
 
 
+def _tool_entry(tool: Any) -> Dict[str, Any]:
+    """One tool in the same shape ``tools/list`` and the Server Card publish."""
+    entry = tool.to_mcp_tool().model_dump(exclude_none=True, by_alias=True)
+    entry.pop("_meta", None)
+    return entry
+
+
+async def _published_tools(mcp: FastMCP) -> Dict[str, Any]:
+    """The published tools by name, first version wins.
+
+    ``list_tools`` returns every version of a tool; the card names each one once and the
+    runner must execute the same one it published, or a caller fills in the form for one
+    schema and runs another.
+    """
+    tools: Dict[str, Any] = {}
+    for tool in await mcp.list_tools():
+        tools.setdefault(tool.name, tool)
+    return tools
+
+
 async def _card_tools(mcp: FastMCP) -> List[Dict[str, Any]]:
     """The published tools in the same shape ``tools/list`` returns.
 
@@ -2113,17 +2140,7 @@ async def _card_tools(mcp: FastMCP) -> List[Dict[str, Any]]:
     ``inputSchema``. Descriptions are published whole -- they are written for the calling model,
     and a clipped one is worse than none. Internal transport metadata (``_meta``) is dropped.
     """
-    entries: List[Dict[str, Any]] = []
-    seen: Set[str] = set()
-    # list_tools returns every version of a tool; the card names each one once.
-    for tool in await mcp.list_tools():
-        if tool.name in seen:
-            continue
-        seen.add(tool.name)
-        entry = tool.to_mcp_tool().model_dump(exclude_none=True, by_alias=True)
-        entry.pop("_meta", None)
-        entries.append(entry)
-    return entries
+    return [_tool_entry(tool) for tool in (await _published_tools(mcp)).values()]
 
 
 async def _server_card(
@@ -2223,6 +2240,145 @@ def _register_server_card(
         )
 
 
+def _tool_result_payload(result: Any) -> Dict[str, Any]:
+    """A ``ToolResult`` as JSON, in the shape ``tools/call`` returns it over the protocol."""
+    payload: Dict[str, Any] = {
+        "isError": bool(getattr(result, "is_error", False)),
+        "content": [block.model_dump(exclude_none=True, by_alias=True) for block in (result.content or [])],
+    }
+    structured = result.structured_content
+    if structured is not None:
+        payload["structuredContent"] = structured
+    return payload
+
+
+def _register_tool_run_api(mcp: FastMCP, os: "AgentOS", timeout_seconds: float) -> None:
+    """Register the plain-HTTP tool runner.
+
+    This exists for an operator UI that tests a tool the way MCP Inspector does, without
+    implementing an MCP client. The tools it runs are the ones the Server Card already
+    publishes, so there is no listing here. The split between an HTTP status and ``isError``
+    follows the protocol: a tool that ran and failed is a successful call carrying a failed
+    result, and only a call that never happened is a 4xx.
+    """
+    import asyncio
+    import time
+
+    # fastmcp raises its own ValidationError for a call whose arguments do not match the
+    # tool's input schema; it is not pydantic's, and it is not a ToolError subclass.
+    from fastmcp.exceptions import NotFoundError
+    from fastmcp.exceptions import ValidationError as ToolValidationError
+    from mcp.shared.exceptions import MCPError
+    from starlette.requests import Request
+    from starlette.responses import JSONResponse, Response
+
+    def _json(payload: Dict[str, Any], status_code: int = 200) -> Response:
+        # Never cached and never readable cross-origin: unlike the card, this surface both
+        # requires a credential and changes state.
+        return JSONResponse(
+            payload,
+            status_code=status_code,
+            headers={"Cache-Control": "no-store", "Vary": "Origin, Authorization"},
+        )
+
+    def _failed(
+        error: str,
+        message: str,
+        status_code: int,
+        *,
+        details: Optional[str] = None,
+        started: Optional[float] = None,
+    ) -> Response:
+        """A failure in the same shape a failed tool call has.
+
+        Every response this endpoint returns carries ``isError`` and ``content``, so a caller
+        renders one thing whatever went wrong -- the protocol itself groups "the tool failed"
+        and "no such tool" into a single failure class. ``error`` names the class for a caller
+        that wants to branch, and the HTTP status still separates a call that never happened
+        (4xx) from a tool that ran and failed (200).
+        """
+        payload: Dict[str, Any] = {
+            "isError": True,
+            "content": [{"type": "text", "text": message}],
+            "error": error,
+        }
+        if details is not None:
+            payload["details"] = details
+        if started is not None:
+            payload["durationMs"] = round((time.perf_counter() - started) * 1000)
+        return _json(payload, status_code=status_code)
+
+    def _denied(request: Request) -> Optional[Response]:
+        """401 when the transport is gated but this request carries no credential.
+
+        The gate itself stays with the transport middleware, which sees the verified
+        identity. This only refuses a request that could not possibly have one, so an
+        unauthenticated caller gets a 401 instead of a tool run.
+        """
+        if _mcp_server_is_open(os):
+            return None
+        if request.headers.get("authorization"):
+            return None
+        return _failed("unauthorized", "This MCP server requires an Authorization header.", 401)
+
+    @mcp.custom_route(MCP_TOOL_RUN_PATH, methods=["POST"], include_in_schema=False)
+    async def run_published_tool(request: Request) -> Response:
+        denied = _denied(request)
+        if denied is not None:
+            return denied
+
+        tool_name = request.path_params["tool_name"]
+        try:
+            body = await request.json()
+        except Exception:
+            return _failed("invalid_json", "Request body must be a JSON object.", 400)
+        if body is None:
+            body = {}
+        if not isinstance(body, dict):
+            return _failed("invalid_json", "Request body must be a JSON object.", 400)
+
+        arguments = body.get("arguments", {})
+        if arguments is None:
+            arguments = {}
+        if not isinstance(arguments, dict):
+            return _failed("invalid_arguments", "'arguments' must be a JSON object.", 400)
+
+        # Resolved against the published surface, so a tool this server does not publish is
+        # not runnable here even when it exists on the registry.
+        if tool_name not in await _published_tools(mcp):
+            return _failed("tool_not_found", f"Unknown tool: {tool_name!r}", 404)
+
+        started = time.perf_counter()
+        try:
+            result = await asyncio.wait_for(mcp.call_tool(tool_name, arguments), timeout=timeout_seconds)
+        except asyncio.TimeoutError:
+            return _failed(
+                "timeout",
+                f"Tool {tool_name!r} did not finish within {timeout_seconds:g}s.",
+                408,
+                started=started,
+            )
+        except NotFoundError as exc:
+            # Racing a surface change between the check above and the call.
+            return _failed("tool_not_found", str(exc), 404, started=started)
+        except ToolValidationError as exc:
+            return _failed(
+                "invalid_arguments",
+                f"Arguments do not match the input schema of {tool_name!r}.",
+                400,
+                details=str(exc),
+                started=started,
+            )
+        except (ToolError, MCPError) as exc:
+            # The tool ran and failed. That is a result, not a transport failure, so the
+            # status stays 200 while the body matches every other failure.
+            return _failed("tool_error", str(exc), 200, started=started)
+
+        payload = _tool_result_payload(result)
+        payload["durationMs"] = round((time.perf_counter() - started) * 1000)
+        return _json(payload)
+
+
 def _accepts_event_stream(accept_header: str) -> bool:
     """True when the Accept header explicitly names ``text/event-stream``.
 
@@ -2299,6 +2455,15 @@ def build_mcp_server(
             server_version,
             card_url=(mcp_config.server_card_url if mcp_config is not None else None),
             allowed_hosts=(mcp_config.allowed_hosts if mcp_config is not None else None),
+        )
+
+    if _tool_run_api_enabled(mcp_config):
+        _register_tool_run_api(
+            mcp,
+            os,
+            timeout_seconds=(
+                mcp_config.tool_run_timeout_seconds if mcp_config is not None else _DEFAULT_TOOL_RUN_TIMEOUT_SECONDS
+            ),
         )
 
     # Classify the tool surface up front: the enabled default-tool tags depend on

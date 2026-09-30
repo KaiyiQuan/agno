@@ -1994,3 +1994,168 @@ async def test_continue_run_requires_the_session_id():
         schema = {t.name: t for t in await client.list_tools()}["continue_run"].input_schema
         assert "session_id" in schema["required"]
         assert "run_id" in schema["required"]
+
+
+# --------------------------- tool run API (HTTP) ---------------------------
+#
+# The plain-HTTP tool surface an operator UI uses to test a tool without speaking the
+# protocol. The contract it must hold: a tool that ran and failed is a 200 carrying
+# ``isError``, and only a call that never happened is a 4xx.
+
+
+def _echo_os(**mcp_kwargs) -> AgentOS:
+    """An OS whose published tool runs without touching a db or a model."""
+
+    def echo(text: str = "hi") -> str:
+        """Returns what it was given."""
+        return f"echo: {text}"
+
+    return AgentOS(
+        name="Echo AgentOS",
+        agents=[_agent()],
+        mcp=MCPConfig(tools=[echo], allowed_hosts=["example.com"], **mcp_kwargs),
+    )
+
+
+async def test_tool_run_api_runs_a_tool_and_returns_its_result():
+    app = get_mcp_server(_echo_os())
+    async with _mcp_client(app) as client:
+        response = await client.post("/mcp/server/tools/echo/run", json={"arguments": {"text": "there"}})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["isError"] is False
+    # Both shapes are carried so a caller can show the text or the parsed payload.
+    assert body["content"][0]["text"] == "echo: there"
+    assert body["structuredContent"]["result"] == "echo: there"
+    assert body["durationMs"] >= 0
+
+
+async def test_tool_run_api_accepts_a_call_without_a_body():
+    """A tool whose arguments are all optional is runnable without sending any."""
+    app = get_mcp_server(_echo_os())
+    async with _mcp_client(app) as client:
+        response = await client.post("/mcp/server/tools/echo/run", json={})
+
+    assert response.status_code == 200
+    assert response.json()["isError"] is False
+
+
+async def test_tool_run_api_reports_a_failing_tool_as_a_result_not_an_error():
+    """The tool ran; it just failed. That is a 200 with ``isError``, like ``tools/call``."""
+    app = get_mcp_server(_docs_os())
+    async with _mcp_client(app) as client:
+        response = await client.post(
+            "/mcp/server/tools/run_agent/run",
+            json={"arguments": {"agent_id": "ghost", "message": "hi"}},
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["isError"] is True
+    assert "ghost" in "".join(block["text"] for block in body["content"])
+
+
+async def test_tool_run_api_reports_every_failure_in_one_shape():
+    """A caller renders one thing whatever went wrong.
+
+    The protocol groups "the tool failed" and "no such tool" into a single failure class, so
+    every response here carries ``isError`` and ``content`` -- only the HTTP status separates
+    a call that never happened from a tool that ran and failed.
+    """
+    app = get_mcp_server(_echo_os())
+    async with _mcp_client(app) as client:
+        failures = [
+            await client.post("/mcp/server/tools/echo/run", json={"arguments": {"text": {"not": "a string"}}}),
+            await client.post("/mcp/server/tools/nope/run", json={"arguments": {}}),
+            await client.post("/mcp/server/tools/echo/run", content=b"not json"),
+        ]
+
+    for response in failures:
+        body = response.json()
+        assert body["isError"] is True, response.text
+        assert body["content"][0]["type"] == "text", response.text
+        assert body["content"][0]["text"], response.text
+        # ``error`` names the class for a caller that wants to branch on it.
+        assert isinstance(body["error"], str), response.text
+
+
+async def test_tool_run_api_rejects_an_unknown_tool():
+    app = get_mcp_server(_docs_os())
+    async with _mcp_client(app) as client:
+        response = await client.post("/mcp/server/tools/not_a_tool/run", json={"arguments": {}})
+
+    assert response.status_code == 404
+    assert response.json()["error"] == "tool_not_found"
+
+
+async def test_tool_run_api_rejects_arguments_that_do_not_match_the_schema():
+    app = get_mcp_server(_docs_os())
+    async with _mcp_client(app) as client:
+        response = await client.post("/mcp/server/tools/run_agent/run", json={"arguments": {"agent_id": "docs-agent"}})
+
+    assert response.status_code == 400
+    assert response.json()["error"] == "invalid_arguments"
+
+
+async def test_tool_run_api_rejects_a_malformed_body():
+    app = get_mcp_server(_docs_os())
+    async with _mcp_client(app) as client:
+        malformed = await client.post("/mcp/server/tools/get_agentos_config/run", content=b"not json")
+        wrong_type = await client.post("/mcp/server/tools/get_agentos_config/run", json={"arguments": []})
+
+    assert malformed.status_code == 400
+    assert malformed.json()["error"] == "invalid_json"
+    assert wrong_type.status_code == 400
+    assert wrong_type.json()["error"] == "invalid_arguments"
+
+
+async def test_tool_run_api_only_serves_tools_this_server_publishes():
+    """A tool scoped out of the surface is not runnable, even though it exists."""
+    os = _docs_os(default_tools=True, exclude_tags={"session"})
+    app = get_mcp_server(os)
+    async with _mcp_client(app) as client:
+        published = {tool["name"] for tool in (await client.get("/mcp/server-card")).json()["tools"]}
+        response = await client.post("/mcp/server/tools/get_sessions/run", json={"arguments": {}})
+
+    assert "get_sessions" not in published
+    assert response.status_code == 404
+
+
+async def test_tool_run_api_times_out_a_tool_that_does_not_finish():
+    async def _sleep() -> str:
+        """Sleeps past the timeout."""
+        await asyncio.sleep(30)
+        return "done"
+
+    os = AgentOS(agents=[_agent()], mcp=MCPConfig(tools=[_sleep], tool_run_timeout_seconds=0.05))
+    app = get_mcp_server(os)
+    async with _mcp_client(app, base_url="http://localhost") as client:
+        response = await client.post("/mcp/server/tools/_sleep/run", json={"arguments": {}})
+
+    assert response.status_code == 408
+    assert response.json()["error"] == "timeout"
+
+
+async def test_tool_run_api_can_be_turned_off_without_affecting_the_card():
+    app = get_mcp_server(_docs_os(tool_run_api=False))
+    async with _mcp_client(app) as client:
+        assert (await client.post("/mcp/server/tools/get_agentos_config/run", json={})).status_code == 404
+        assert (await client.get("/mcp/server-card")).status_code == 200
+
+
+async def test_tool_run_api_does_not_claim_a_sibling_path():
+    """``/mcp/servers`` shares a prefix with ``/mcp/server`` but is a different route.
+
+    The plural is deliberately left free for the servers this OS connects to.
+    """
+    app = get_mcp_server(_docs_os())
+    async with _mcp_client(app) as client:
+        assert (await client.get("/mcp/servers")).status_code == 404
+        assert (await client.get("/mcp/server/toolshed")).status_code == 404
+
+
+def test_server_path_may_not_collide_with_a_transport_path():
+    """One alias may not sit on another's ``/server`` subtree, which would shadow the runner."""
+    with pytest.raises(ValueError, match="must not overlap"):
+        MCPConfig(default_tools=True, path="/a", path_aliases=["/a/server"])

@@ -17,6 +17,18 @@ MCPBuiltinTag = Literal["core", "session", "lifecycle"]
 # Where the MCP server publishes its Server Card: the MCP endpoint path plus ``/server-card``.
 MCP_SERVER_CARD_PATH = "/mcp/server-card"
 
+# Where the MCP server runs one published tool over plain HTTP, for an operator UI that tests
+# a tool without speaking the protocol. Like the card, the route registers at the canonical
+# ``/mcp`` prefix and ``MCPRoutingMiddleware`` maps a configured ``path``/``root_host`` onto it.
+#
+# ``server`` (singular) names the server this deployment IS, leaving ``/mcp/servers/<name>/...``
+# free for the servers it CONNECTS TO: an agent-consumed MCP server has tools of its own, and
+# flattening both under one ``/mcp/tools`` prefix would make the same path mean two things.
+# ``MCP_SERVER_TOOLS_PATH`` is the subtree the runner lives under: route matching and the
+# public-surface admission rules both reason about the whole subtree, not the one route.
+MCP_SERVER_TOOLS_PATH = "/mcp/server/tools"
+MCP_TOOL_RUN_PATH = "/mcp/server/tools/{tool_name}/run"
+
 
 def _apply_legacy_enable_builtin_tools(data: Dict[str, Any]) -> Dict[str, Any]:
     """Map the deprecated ``enable_builtin_tools`` key onto ``default_tools`` in a dict
@@ -78,6 +90,20 @@ class MCPConfig(BaseModel):
     # host would otherwise be echoed into a publicly cacheable document.
     server_card_url: Optional[str] = None
 
+    # Run one published tool over plain HTTP at ``/mcp/server/tools/{name}/run``, so an operator UI
+    # can test a tool without implementing an MCP client. The tools themselves are read from
+    # the Server Card, which already publishes each one's input schema. Unlike the card this
+    # is never public: running a tool is not discovery, and the default surface includes tools
+    # that spend tokens and write sessions. It sits behind the same gate as the transport, so
+    # a server reachable only with a bearer token requires that token here too.
+    tool_run_api: bool = True
+
+    # How long a single ``/mcp/server/tools/{name}/run`` call may take before it is abandoned with a
+    # 408. A run tool drives a model, so this is generous; it exists so a hung tool cannot hold
+    # a connection open indefinitely. The MCP transport has no such limit -- a protocol client
+    # manages its own.
+    tool_run_timeout_seconds: float = Field(default=120.0, gt=0)
+
     # External transport path and optional legacy aliases. Policies use one native MCP route.
     path: str = "/mcp"
     path_aliases: List[str] = Field(default_factory=list)
@@ -92,8 +118,12 @@ class MCPConfig(BaseModel):
             if not re.fullmatch(r"/(?:[A-Za-z0-9_-]+/)*[A-Za-z0-9_-]+", path):
                 raise ValueError("MCP paths must be non-root absolute paths with plain segments; use root_host for /")
         paths = [self.path, *self.path_aliases]
-        if len(set(paths)) != len(paths) or any(p + "/server-card" in paths for p in paths):
-            raise ValueError("MCP transport and server-card paths must not overlap")
+        # A transport path that collides with another path's card or tools route would be
+        # shadowed by it, so one alias can never sit on another's sub-routes.
+        if len(set(paths)) != len(paths) or any(
+            p + suffix in paths for p in paths for suffix in ("/server-card", "/server")
+        ):
+            raise ValueError("MCP transport, server-card and server paths must not overlap")
         if self.root_host is not None:
             if not re.fullmatch(
                 r"(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?",

@@ -307,3 +307,26 @@ and the SQLite file removed afterwards.
   with no violations.
 - `git diff --check` passed for the lesson and consumed legacy MCP folder.
 - All scoped servers were stopped after testing.
+
+### inspect_tools.py
+
+**Status:** PASS
+
+**Description:** Added and first tested LIVE on 2026-09-29 on the
+`feat/mcp-tool-run-api` branch, when `POST /mcp/server/tools/{name}/run` landed. The
+tool list is read from the Server Card, which already publishes each tool's
+input schema, so the runner adds no listing of its own. Ran the server and drove
+it with the `--client` flow: read the eight default tools with their `required`
+arrays off the card, ran `get_agentos_config` (19 ms) and `run_agent` against a
+live model (2188 ms), then exercised the three failure classes.
+
+**Result:** `get_agentos_config` returned `isError: false` with the
+`support-agent` id in `structuredContent`, and `run_agent` returned the model's
+answer as text. A run naming a missing agent came back HTTP 200 with
+`isError: true` -- the tool ran and failed, which is a result, not a transport
+error. Omitting the required `message` was refused with HTTP 400
+`invalid_arguments` before the tool ran, and an unpublished name with HTTP 404
+`tool_not_found`. The server logs a traceback for each of those two deliberate
+failures; that is the tool erroring as intended, not the endpoint failing.
+
+---
