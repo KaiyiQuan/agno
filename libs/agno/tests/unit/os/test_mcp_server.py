@@ -23,6 +23,7 @@ from uuid import uuid4  # noqa: E402
 
 import httpx  # noqa: E402
 from fastmcp import Client, Context  # noqa: E402
+from fastmcp.utilities.versions import VersionSpec  # noqa: E402
 from starlette.middleware import Middleware  # noqa: E402
 from starlette.middleware.base import BaseHTTPMiddleware  # noqa: E402
 
@@ -2108,6 +2109,41 @@ async def test_tool_run_api_rejects_a_malformed_body():
     assert malformed.json()["error"] == "invalid_json"
     assert wrong_type.status_code == 400
     assert wrong_type.json()["error"] == "invalid_arguments"
+
+
+async def test_tool_run_api_runs_the_version_whose_schema_it_published():
+    """The published schema and the executed tool must be the same version.
+
+    ``list_tools`` returns every version of a tool. If the card publishes one version's
+    input schema while ``call_tool`` resolves the name to another, a caller fills in the
+    form correctly and the run fails -- or worse, silently does something else.
+    """
+    os = AgentOS(agents=[_agent()], mcp=MCPConfig(tools=[_agent().as_tool(name="ask")]))
+    server = build_mcp_server(os)
+
+    @server.tool(name="versioned", version="1")
+    def _v1(only_in_v1: int) -> str:
+        """First version."""
+        return "v1 ran"
+
+    @server.tool(name="versioned", version="2")
+    def _v2(only_in_v2: str) -> str:
+        """Second version."""
+        return "v2 ran"
+
+    published = (await mcp_mod._published_tools(server))["versioned"]
+    schema_fields = set(published.to_mcp_tool().input_schema.get("properties", {}))
+
+    # Whichever version is published, calling it with that schema's arguments must run it.
+    arguments = {field: (1 if field == "only_in_v1" else "x") for field in schema_fields}
+    result = await server.call_tool(
+        "versioned", arguments, version=VersionSpec(eq=published.version) if published.version else None
+    )
+
+    expected = "v1 ran" if "only_in_v1" in schema_fields else "v2 ran"
+    assert "".join(getattr(block, "text", "") for block in result.content) == expected
+    # fastmcp resolves a bare name to its highest version, so the card must publish that one.
+    assert published.version == "2"
 
 
 async def test_tool_run_api_only_serves_tools_this_server_publishes():

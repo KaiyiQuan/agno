@@ -2120,16 +2120,17 @@ def _tool_entry(tool: Any) -> Dict[str, Any]:
 
 
 async def _published_tools(mcp: FastMCP) -> Dict[str, Any]:
-    """The published tools by name, first version wins.
+    """The published tools by name, highest version per name.
 
-    ``list_tools`` returns every version of a tool; the card names each one once and the
-    runner must execute the same one it published, or a caller fills in the form for one
-    schema and runs another.
+    ``list_tools`` returns every version of a tool. Deduplication goes through fastmcp's own
+    ``dedupe_with_versions`` so this picks the same version a connected client resolves to --
+    keeping the first one instead would publish an older schema than ``tools/call`` executes,
+    and a caller would fill in the form for one schema and run another. The runner pins its
+    call to the version selected here, so the two cannot drift apart.
     """
-    tools: Dict[str, Any] = {}
-    for tool in await mcp.list_tools():
-        tools.setdefault(tool.name, tool)
-    return tools
+    from fastmcp.utilities.versions import dedupe_with_versions
+
+    return {tool.name: tool for tool in dedupe_with_versions(await mcp.list_tools(), lambda t: t.name)}
 
 
 async def _card_tools(mcp: FastMCP) -> List[Dict[str, Any]]:
@@ -2268,6 +2269,7 @@ def _register_tool_run_api(mcp: FastMCP, os: "AgentOS", timeout_seconds: float) 
     # tool's input schema; it is not pydantic's, and it is not a ToolError subclass.
     from fastmcp.exceptions import NotFoundError
     from fastmcp.exceptions import ValidationError as ToolValidationError
+    from fastmcp.utilities.versions import VersionSpec
     from mcp.shared.exceptions import MCPError
     from starlette.requests import Request
     from starlette.responses import JSONResponse, Response
@@ -2345,12 +2347,20 @@ def _register_tool_run_api(mcp: FastMCP, os: "AgentOS", timeout_seconds: float) 
 
         # Resolved against the published surface, so a tool this server does not publish is
         # not runnable here even when it exists on the registry.
-        if tool_name not in await _published_tools(mcp):
+        published = (await _published_tools(mcp)).get(tool_name)
+        if published is None:
             return _failed("tool_not_found", f"Unknown tool: {tool_name!r}", 404)
+
+        # Pin the call to the version whose schema was published. Left unset, fastmcp resolves
+        # the name to its own highest version, which is the same tool today only because both
+        # sides happen to agree -- stating it here means the form and the run cannot diverge.
+        version = VersionSpec(eq=published.version) if published.version is not None else None
 
         started = time.perf_counter()
         try:
-            result = await asyncio.wait_for(mcp.call_tool(tool_name, arguments), timeout=timeout_seconds)
+            result = await asyncio.wait_for(
+                mcp.call_tool(tool_name, arguments, version=version), timeout=timeout_seconds
+            )
         except asyncio.TimeoutError:
             return _failed(
                 "timeout",

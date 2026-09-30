@@ -18,14 +18,7 @@ MCPBuiltinTag = Literal["core", "session", "lifecycle"]
 MCP_SERVER_CARD_PATH = "/mcp/server-card"
 
 # Where the MCP server runs one published tool over plain HTTP, for an operator UI that tests
-# a tool without speaking the protocol. Like the card, the route registers at the canonical
-# ``/mcp`` prefix and ``MCPRoutingMiddleware`` maps a configured ``path``/``root_host`` onto it.
-#
-# ``server`` (singular) names the server this deployment IS, leaving ``/mcp/servers/<name>/...``
-# free for the servers it CONNECTS TO: an agent-consumed MCP server has tools of its own, and
-# flattening both under one ``/mcp/tools`` prefix would make the same path mean two things.
-# ``MCP_SERVER_TOOLS_PATH`` is the subtree the runner lives under: route matching and the
-# public-surface admission rules both reason about the whole subtree, not the one route.
+# a tool without speaking the protocol.
 MCP_SERVER_TOOLS_PATH = "/mcp/server/tools"
 MCP_TOOL_RUN_PATH = "/mcp/server/tools/{tool_name}/run"
 
@@ -92,10 +85,7 @@ class MCPConfig(BaseModel):
 
     # Run one published tool over plain HTTP at ``/mcp/server/tools/{name}/run``, so an operator UI
     # can test a tool without implementing an MCP client. The tools themselves are read from
-    # the Server Card, which already publishes each one's input schema. Unlike the card this
-    # is never public: running a tool is not discovery, and the default surface includes tools
-    # that spend tokens and write sessions. It sits behind the same gate as the transport, so
-    # a server reachable only with a bearer token requires that token here too.
+    # the Server Card, which already publishes each one's input schema.
     tool_run_api: bool = True
 
     # How long a single ``/mcp/server/tools/{name}/run`` call may take before it is abandoned with a
