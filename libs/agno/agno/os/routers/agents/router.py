@@ -2161,6 +2161,7 @@ def get_agent_router(
                 agent_id,
                 os.agents,
                 factory.db,
+                request=request,
                 session_id=session_id,
                 published_only=False,
             )
@@ -2265,6 +2266,7 @@ def get_agent_router(
                 agent_id,
                 os.agents,
                 factory.db,
+                request=request,
                 session_id=session_id,
                 published_only=False,
             )
@@ -2336,6 +2338,7 @@ def get_agent_router(
                 agent_id,
                 os.agents,
                 factory.db,
+                request=request,
                 session_id=session_id,
                 published_only=False,
             )
@@ -2525,6 +2528,7 @@ def get_agent_router(
                 agent_id,
                 os.agents,
                 factory.db,
+                request=request,
                 session_id=session_id,
                 published_only=False,
             )
